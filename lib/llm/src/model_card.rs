@@ -61,24 +61,29 @@ impl ModelInfoType {
 #[serde(rename_all = "snake_case")]
 pub enum TokenizerKind {
     HfTokenizerJson(CheckedFile),
+    TikTokenModel(CheckedFile),
 }
 
 impl TokenizerKind {
     pub fn checksum(&self) -> String {
         match self {
-            TokenizerKind::HfTokenizerJson(c) => c.checksum().to_string(),
+            TokenizerKind::HfTokenizerJson(c) | TokenizerKind::TikTokenModel(c) => {
+                c.checksum().to_string()
+            }
         }
     }
 
     pub fn is_local(&self) -> bool {
         match self {
-            TokenizerKind::HfTokenizerJson(c) => c.is_local(),
+            TokenizerKind::HfTokenizerJson(c) | TokenizerKind::TikTokenModel(c) => c.is_local(),
         }
     }
 
     pub fn update_dir(&mut self, dir: &Path) {
         match self {
-            TokenizerKind::HfTokenizerJson(c) => c.update_dir(dir),
+            TokenizerKind::HfTokenizerJson(c) | TokenizerKind::TikTokenModel(c) => {
+                c.update_dir(dir)
+            }
         }
     }
 }
@@ -230,6 +235,10 @@ pub struct ModelDeploymentCard {
     /// `Text` for engines that take care of pre-processing themselves.
     pub model_input: ModelInput,
 
+    /// LoRA metadata for routing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora: Option<LoraInfo>,
+
     /// User-defined metadata for custom worker behavior
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<serde_json::Value>,
@@ -247,6 +256,17 @@ pub struct ModelDeploymentCard {
 
     #[serde(skip, default)]
     checksum: OnceLock<String>,
+}
+
+/// LoRA adapter information for routing decisions
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoraInfo {
+    /// LoRA adapter name (e.g., "customer-123-v2")
+    pub name: String,
+
+    /// Maximum number of LoRA adapters that can be loaded at once on a single GPU
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_gpu_lora_count: Option<u32>,
 }
 
 impl ModelDeploymentCard {
@@ -356,13 +376,15 @@ impl ModelDeploymentCard {
         self.tokenizer.is_some()
     }
 
-    pub fn tokenizer_hf(&self) -> anyhow::Result<HfTokenizer> {
+    /// Load the tokenizer as a generic, backend-agnostic `Tokenizer` trait object.
+    /// This supports both HuggingFace `tokenizer.json` and tiktoken `.model`/`.tiktoken` files.
+    pub fn tokenizer(&self) -> anyhow::Result<crate::tokenizers::Tokenizer> {
         match &self.tokenizer {
             Some(TokenizerKind::HfTokenizerJson(checked_file)) => {
                 let p = checked_file.path().ok_or_else(|| {
                     anyhow::anyhow!("Tokenizer is URL-backed ({:?})", checked_file.url())
                 })?;
-                HfTokenizer::from_file(p)
+                let hf = HfTokenizer::from_file(p)
                     .inspect_err(|err| {
                         if let Some(serde_err) = err.downcast_ref::<serde_json::Error>()
                             && let Ok(contents) = std::fs::read_to_string(p)
@@ -371,7 +393,23 @@ impl ModelDeploymentCard {
                         }
                     })
                     .map_err(anyhow::Error::msg)
-                    .with_context(|| p.display().to_string())
+                    .with_context(|| p.display().to_string())?;
+                Ok(crate::tokenizers::Tokenizer::from(Arc::new(
+                    crate::tokenizers::HuggingFaceTokenizer::from_tokenizer(hf),
+                )))
+            }
+            Some(TokenizerKind::TikTokenModel(checked_file)) => {
+                let p = checked_file.path().ok_or_else(|| {
+                    anyhow::anyhow!("Tokenizer is URL-backed ({:?})", checked_file.url())
+                })?;
+                let path_str = p.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("Tokenizer path contains invalid UTF-8: {}", p.display())
+                })?;
+                let tokenizer = crate::tokenizers::TikTokenTokenizer::from_file_auto(path_str)
+                    .with_context(|| {
+                        format!("Failed to load tiktoken tokenizer from {}", p.display())
+                    })?;
+                Ok(crate::tokenizers::Tokenizer::from(Arc::new(tokenizer)))
             }
             None => {
                 anyhow::bail!(
@@ -465,8 +503,9 @@ impl ModelDeploymentCard {
             PromptFormatterArtifact::HfTokenizerConfigJson
         );
 
-        // tokenizer.json
+        // tokenizer.json or tiktoken.model
         change!(self.tokenizer, TokenizerKind::HfTokenizerJson);
+        change!(self.tokenizer, TokenizerKind::TikTokenModel);
 
         // We only "move" the chat template if it came form the repo. If we have a custom template
         // file we cannot download that from HF.
@@ -651,6 +690,7 @@ impl ModelDeploymentCard {
             migration_limit: 0,
             model_type: Default::default(),  // set later
             model_input: Default::default(), // set later
+            lora: None,
             user_data: None,
             runtime_config: ModelRuntimeConfig::default(),
             media_decoder: None,
@@ -684,8 +724,8 @@ pub trait ModelInfo: Send + Sync {
     /// Model type
     fn model_type(&self) -> String;
 
-    /// Token ID for the beginning of sequence
-    fn bos_token_id(&self) -> TokenIdType;
+    /// Token ID for the beginning of sequence (optional - not all models have it)
+    fn bos_token_id(&self) -> Option<TokenIdType>;
 
     /// Token ID for the end of sequence
     fn eos_token_ids(&self) -> Vec<TokenIdType>;
@@ -729,12 +769,8 @@ struct HFConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HFTextConfig {
-    // It can take multiple attempts to load this, so Option
+    // Optional - not all models have a bos_token_id
     bos_token_id: Option<TokenIdType>,
-
-    // We set this once bos_token_id is loaded so we don't have to deal with Option
-    #[serde(default)]
-    final_bos_token_id: TokenIdType,
 
     eos_token_id: Option<serde_json::Value>,
 
@@ -771,7 +807,6 @@ impl HFConfig {
             config.text_config = Some(text_config);
         }
 
-        // Sometimes bos_token_id is in generation_config.json not config.json
         let Some(text_config) = config.text_config.as_mut() else {
             anyhow::bail!(
                 "Missing text config fields (model_type, eos_token_ids, etc) in config.json"
@@ -782,16 +817,13 @@ impl HFConfig {
             .parent()
             .unwrap_or_else(|| Path::new(""))
             .join("generation_config.json");
+
+        // bos_token_id is optional - not all models have it
+        // Try to load from generation_config.json if not in config.json
         if text_config.bos_token_id.is_none() {
-            let bos_token_id = crate::file_json_field::<TokenIdType>(&gencfg_path, "bos_token_id")
-                .context(
-                    "missing bos_token_id in generation_config.json and config.json, cannot load",
-                )?;
-            text_config.bos_token_id = Some(bos_token_id);
+            text_config.bos_token_id =
+                crate::file_json_field::<TokenIdType>(&gencfg_path, "bos_token_id").ok();
         }
-        // Now that we have it for sure, set it in the non-Option field
-        let final_bos_token_id = text_config.bos_token_id.take().unwrap();
-        text_config.final_bos_token_id = final_bos_token_id;
 
         // TODO: refactor this when we switch to per-architecture tokenization
         // eos_token_id can appear in multiple places, and as suggested by HuggingFace
@@ -867,8 +899,8 @@ impl ModelInfo for HFConfig {
         self.model_type.clone()
     }
 
-    fn bos_token_id(&self) -> TokenIdType {
-        self.text_config.as_ref().unwrap().final_bos_token_id
+    fn bos_token_id(&self) -> Option<TokenIdType> {
+        self.text_config.as_ref().and_then(|tc| tc.bos_token_id)
     }
 
     fn eos_token_ids(&self) -> Vec<TokenIdType> {
@@ -937,13 +969,44 @@ impl PromptFormatterArtifact {
 
 impl TokenizerKind {
     pub fn from_disk(directory: &Path) -> Result<Self> {
-        let f = CheckedFile::from_disk(directory.join("tokenizer.json")).with_context(|| {
-            format!(
-                "unable to extract tokenizer kind from directory {}",
-                directory.display()
-            )
-        })?;
-        Ok(Self::HfTokenizerJson(f))
+        // 1. Try tokenizer.json (HuggingFace)
+        if let Ok(f) = CheckedFile::from_disk(directory.join("tokenizer.json")) {
+            return Ok(Self::HfTokenizerJson(f));
+        }
+
+        // 2. Try tiktoken.model
+        if let Ok(f) = CheckedFile::from_disk(directory.join("tiktoken.model")) {
+            return Ok(Self::TikTokenModel(f));
+        }
+
+        // 3. Search for any *.tiktoken file
+        let tiktoken_files: Vec<_> = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "tiktoken"))
+            .collect();
+
+        if tiktoken_files.len() == 1 {
+            if let Ok(f) = CheckedFile::from_disk(tiktoken_files[0].path()) {
+                return Ok(Self::TikTokenModel(f));
+            }
+        } else if tiktoken_files.len() > 1 {
+            let names: Vec<_> = tiktoken_files
+                .iter()
+                .map(|e| e.path().display().to_string())
+                .collect();
+            anyhow::bail!(
+                "Multiple .tiktoken files found in {}: {:?}. Cannot determine which to use.",
+                directory.display(),
+                names
+            );
+        }
+
+        anyhow::bail!(
+            "No tokenizer.json or tiktoken model file found in {}",
+            directory.display()
+        )
     }
 }
 
@@ -983,7 +1046,7 @@ mod tests {
         let config_file = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/sample-models/mock-llama-3.1-8b-instruct/config.json");
         let config = HFConfig::from_json_file(&config_file)?;
-        assert_eq!(config.bos_token_id(), 128000);
+        assert_eq!(config.bos_token_id(), Some(128000));
         // eos_token_ids can be in any order as long as the set is correct
         let eos_token_id_set: HashSet<_> = config.eos_token_ids().iter().cloned().collect();
         assert_eq!(eos_token_id_set, vec![128001, 128009].into_iter().collect());
@@ -995,7 +1058,7 @@ mod tests {
         let config_file = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/sample-models/Llama-4-Scout-17B-16E-Instruct/config.json");
         let config = HFConfig::from_json_file(&config_file)?;
-        assert_eq!(config.bos_token_id(), 200000);
+        assert_eq!(config.bos_token_id(), Some(200000));
         Ok(())
     }
 

@@ -120,12 +120,9 @@ impl DeltaGenerator {
 
         let completion_id = format!("cmpl-{request_id}");
 
-        // Create request tracker if tracking is enabled
-        let tracker = if options.enable_tracking {
-            Some(Arc::new(RequestTracker::new()))
-        } else {
-            None
-        };
+        // Always create request tracker for per-worker metrics (TTFT, ITL per worker_id).
+        // The enable_tracking option only controls whether timing info is included in the response.
+        let tracker = Some(Arc::new(RequestTracker::new()));
 
         Self {
             id: completion_id,
@@ -326,11 +323,6 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
         let index = delta.index.unwrap_or(0);
         let mut response = self.create_choice(index, delta.text.clone(), finish_reason, logprobs);
 
-        // Record first token time (only succeeds on first call due to OnceLock)
-        if let Some(ref tracker) = self.tracker {
-            tracker.record_first_token();
-        }
-
         // Get worker_id info from tracker (set by KvPushRouter based on phase)
         let worker_id_info = self.tracker.as_ref().and_then(|t| t.get_worker_info());
 
@@ -339,6 +331,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
             .as_ref()
             .and_then(|params| params.get("token_ids"))
             .and_then(|v| serde_json::from_value::<Vec<u32>>(v.clone()).ok());
+        let routed_experts = delta
+            .disaggregated_params
+            .as_ref()
+            .and_then(|params| params.get("routed_experts"))
+            .cloned();
 
         // Get timing info if this is the final response (has finish_reason)
         let timing_info: Option<TimingInfo> = if finish_reason.is_some() {
@@ -350,12 +347,17 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
             None
         };
 
-        // Inject nvext if we have worker_id, token_ids, or timing
-        if worker_id_info.is_some() || token_ids.is_some() || timing_info.is_some() {
+        // Inject nvext if we have worker_id, token_ids, timing, or routed experts.
+        if worker_id_info.is_some()
+            || token_ids.is_some()
+            || timing_info.is_some()
+            || routed_experts.is_some()
+        {
             let nvext_response = NvExtResponse {
                 worker_id: worker_id_info.clone(),
                 timing: timing_info,
                 token_ids: token_ids.clone(),
+                routed_experts,
             };
 
             if let Ok(nvext_json) = serde_json::to_value(&nvext_response) {
@@ -397,5 +399,9 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
 
     fn get_usage(&self) -> dynamo_async_openai::types::CompletionUsage {
         DeltaGenerator::get_usage(self)
+    }
+
+    fn tracker(&self) -> Option<std::sync::Arc<crate::protocols::common::timing::RequestTracker>> {
+        self.tracker.clone()
     }
 }

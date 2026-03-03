@@ -17,15 +17,22 @@ Usage (both patterns supported):
     # Pattern 1: Import module
     from dynamo import prometheus_names
     print(prometheus_names.frontend_service.REQUESTS_TOTAL)  # "requests_total"
-    print(prometheus_names.kvstats.ACTIVE_BLOCKS)  # "kvstats_active_blocks"
+    print(prometheus_names.work_handler.ERRORS_TOTAL)  # "errors_total"
 
     # Pattern 2: Import specific classes
-    from dynamo.prometheus_names import frontend_service, kvstats
+    from dynamo.prometheus_names import frontend_service, work_handler
     print(frontend_service.REQUESTS_TOTAL)  # "requests_total"
-    print(kvstats.ACTIVE_BLOCKS)  # "kvstats_active_blocks"
+    print(work_handler.ERRORS_TOTAL)  # "errors_total"
 """
 
 from __future__ import annotations
+
+
+class component_names:
+    """Well-known component names used as values for the `dynamo_component` label."""
+
+    # Component name for the KV router (frontend-side request routing).
+    ROUTER = "router"
 
 
 class distributed_runtime:
@@ -55,8 +62,12 @@ class frontend_service:
     INPUT_SEQUENCE_TOKENS = "input_sequence_tokens"
     # Output sequence length in tokens
     OUTPUT_SEQUENCE_TOKENS = "output_sequence_tokens"
+    # Predicted KV cache hit rate at routing time (0.0-1.0)
+    KV_HIT_RATE = "kv_hit_rate"
     # Number of cached tokens (prefix cache hits) per request
     CACHED_TOKENS = "cached_tokens"
+    # Tokenizer latency in milliseconds
+    TOKENIZER_LATENCY_MS = "tokenizer_latency_ms"
     # Total number of output tokens generated (counter that updates in real-time)
     OUTPUT_TOKENS_TOTAL = "output_tokens_total"
     # Time to first token in seconds
@@ -80,8 +91,28 @@ class frontend_service:
     MODEL_MIGRATION_LIMIT = "model_migration_limit"
     # Total number of request migrations due to worker unavailability
     MODEL_MIGRATION_TOTAL = "model_migration_total"
+    # Active decode blocks (KV cache blocks) per worker
+    # Gauge metric tracking current KV cache block utilization for each worker
+    WORKER_ACTIVE_DECODE_BLOCKS = "worker_active_decode_blocks"
+    # Active prefill tokens per worker
+    # Gauge metric tracking current queued prefill tokens for each worker
+    WORKER_ACTIVE_PREFILL_TOKENS = "worker_active_prefill_tokens"
+    # Last observed time to first token per worker (in seconds)
+    # Gauge metric tracking the most recent TTFT for each worker
+    WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS = "worker_last_time_to_first_token_seconds"
+    # Last observed input sequence tokens per worker
+    # Gauge metric tracking the input token count from the same request as WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS
+    # Updated atomically with TTFT to correlate latency with input size
+    WORKER_LAST_INPUT_SEQUENCE_TOKENS = "worker_last_input_sequence_tokens"
+    # Last observed inter-token latency per worker (in seconds)
+    # Gauge metric tracking the most recent ITL for each worker
+    WORKER_LAST_INTER_TOKEN_LATENCY_SECONDS = "worker_last_inter_token_latency_seconds"
+    # Number of requests pending in the router's scheduler queue (gauge per worker_type)
+    ROUTER_QUEUE_PENDING_REQUESTS = "router_queue_pending_requests"
     # Label name for the type of migration
     MIGRATION_TYPE_LABEL = "migration_type"
+    # Label name for tokenizer operation
+    OPERATION_LABEL = "operation"
 
 
 class kvbm:
@@ -103,6 +134,20 @@ class kvbm:
     HOST_CACHE_HIT_RATE = "host_cache_hit_rate"
     # Disk cache hit rate (0.0-1.0) from the sliding window
     DISK_CACHE_HIT_RATE = "disk_cache_hit_rate"
+    # Object storage cache hit rate (0.0-1.0) from the sliding window
+    OBJECT_CACHE_HIT_RATE = "object_cache_hit_rate"
+    # Number of blocks offloaded from device to object storage
+    OFFLOAD_BLOCKS_D2O = "offload_blocks_d2o"
+    # Number of blocks onboarded from object storage to device
+    ONBOARD_BLOCKS_O2D = "onboard_blocks_o2d"
+    # Bytes transferred to object storage (offload)
+    OFFLOAD_BYTES_OBJECT = "offload_bytes_object"
+    # Bytes transferred from object storage (onboard)
+    ONBOARD_BYTES_OBJECT = "onboard_bytes_object"
+    # Number of failed object storage read operations (blocks)
+    OBJECT_READ_FAILURES = "object_read_failures"
+    # Number of failed object storage write operations (blocks)
+    OBJECT_WRITE_FAILURES = "object_write_failures"
 
 
 class kvrouter:
@@ -111,18 +156,10 @@ class kvrouter:
 
 
 class kvstats:
-    """KvStats metrics from LLM workers"""
-
-    # Prefix for all KvStats metrics
-    PREFIX = ""
-    # Number of active KV cache blocks currently in use
-    ACTIVE_BLOCKS = "kvstats_active_blocks"
-    # Total number of KV cache blocks available
-    TOTAL_BLOCKS = "kvstats_total_blocks"
+    # Total number of KV cache blocks available on the worker
+    TOTAL_BLOCKS = "total_blocks"
     # GPU cache usage as a percentage (0.0-1.0)
-    GPU_CACHE_USAGE_PERCENT = "kvstats_gpu_cache_usage_percent"
-    # GPU prefix cache hit rate as a percentage (0.0-1.0)
-    GPU_PREFIX_CACHE_HIT_RATE = "kvstats_gpu_prefix_cache_hit_rate"
+    GPU_CACHE_USAGE_PERCENT = "gpu_cache_usage_percent"
 
 
 class labels:
@@ -134,6 +171,30 @@ class labels:
     NAMESPACE = "dynamo_namespace"
     # Label for endpoint identification
     ENDPOINT = "dynamo_endpoint"
+    # Label for worker data-parallel rank.
+    # Note: this is not an auto-inserted label like `dynamo_namespace`/`dynamo_component`.
+    # It is used by worker/load-style metrics that need to disambiguate per-worker series.
+    DP_RANK = "dp_rank"
+    # Label for worker instance ID (etcd lease ID).
+    WORKER_ID = "worker_id"
+    # Label for model name/path (OpenAI API standard, injected by Dynamo)
+    # This is the standard label name injected by all backends in metrics_labels=[("model", ...)].
+    # Ensures compatibility with OpenAI-compatible tooling.
+    MODEL = "model"
+    # Label for model name/path (alternative/native engine label, injected by Dynamo)
+    # Some engines natively use model_name, so we inject both model and model_name
+    # to ensure maximum compatibility with both OpenAI standard and engine-native tooling.
+    # When a metric already has a label, injection does not overwrite it (original is preserved).
+    MODEL_NAME = "model_name"
+    # Label for worker type (e.g., "aggregated", "prefill", "decode", "encoder", etc.)
+    WORKER_TYPE = "worker_type"
+    # Label for router instance (discovery.instance_id() of the frontend)
+    ROUTER_ID = "router_id"
+
+
+class model_info:
+    # Model load time in seconds
+    LOAD_TIME_SECONDS = "model_load_time_seconds"
 
 
 class name_prefix:
@@ -143,6 +204,46 @@ class name_prefix:
     COMPONENT = "dynamo_component"
     # Prefix for frontend service metrics
     FRONTEND = "dynamo_frontend"
+    # Prefix for KV router metrics (used with router_id label)
+    ROUTER = "dynamo_router"
+
+
+class router:
+    """Router request metrics (component-scoped aggregate histograms + counter)"""
+
+    # Total number of requests processed by the router
+    REQUESTS_TOTAL = "router_requests_total"
+    # Time to first token observed at the router (seconds)
+    TIME_TO_FIRST_TOKEN_SECONDS = "router_time_to_first_token_seconds"
+    # Average inter-token latency observed at the router (seconds)
+    INTER_TOKEN_LATENCY_SECONDS = "router_inter_token_latency_seconds"
+    # Input sequence length in tokens observed at the router
+    INPUT_SEQUENCE_TOKENS = "router_input_sequence_tokens"
+    # Output sequence length in tokens observed at the router
+    OUTPUT_SEQUENCE_TOKENS = "router_output_sequence_tokens"
+
+
+class router_request:
+    """Router per-request metrics (component-scoped via `MetricsHierarchy`)."""
+
+    # Prefix prepended to `frontend_service::*` names to form router metric names.
+    # e.g. `"router_"` + `frontend_service::REQUESTS_TOTAL` → `"router_requests_total"`.
+    METRIC_PREFIX = "router_"
+
+
+class routing_overhead:
+    """Routing overhead phase latency histogram suffixes."""
+
+    # Time spent computing block hashes
+    BLOCK_HASHING_MS = "overhead_block_hashing_ms"
+    # Time spent in indexer find_matches
+    INDEXER_FIND_MATCHES_MS = "overhead_indexer_find_matches_ms"
+    # Time spent computing sequence hashes
+    SEQ_HASHING_MS = "overhead_seq_hashing_ms"
+    # Time spent in scheduler worker selection
+    SCHEDULING_MS = "overhead_scheduling_ms"
+    # Total routing overhead per request
+    TOTAL_MS = "overhead_total_ms"
 
 
 class task_tracker:
